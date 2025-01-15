@@ -1,9 +1,10 @@
 #![feature(slice_as_array)]
 
 use std::{
-    fmt::Debug,
+    env,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::Write,
+    process,
 };
 
 use aes_gcm::{
@@ -15,6 +16,7 @@ use argon2::Argon2;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 const MIN_PASS_LEN: usize = 8;
 
@@ -42,7 +44,7 @@ impl Vault {
         serde_json::from_slice(&content).with_context(|| "Failed to deserialize file JSON")
     }
 
-    pub fn open(&self, pass: &str) -> anyhow::Result<String> {
+    pub fn read(&self, pass: &str) -> anyhow::Result<String> {
         let key = derive_key(pass)?;
         let plaintext = decrypt(&key, &self.nonce, &self.ciphertext)?;
         if !validate_cert(&self.cert, &plaintext) {
@@ -52,9 +54,10 @@ impl Vault {
             .with_context(|| "Failed to convert plaintext into UTF-8 string")
     }
 
-    pub fn write(&self, path: &str) -> anyhow::Result<()> {
+    pub fn write(&self, path: &str, overwrite: bool) -> anyhow::Result<()> {
         OpenOptions::new()
-            .create_new(true)
+            .create_new(!overwrite)
+            .truncate(overwrite)
             .write(true)
             .open(path)
             .with_context(|| "Failed to create file")?
@@ -63,6 +66,7 @@ impl Vault {
     }
 }
 
+/// A tool for managing vaults - arbitrary pieces of data protected by passphrases.
 #[derive(Parser, Debug)]
 struct Cli {
     #[command(subcommand)]
@@ -71,41 +75,69 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Edit the data inside a vault.
     #[command(arg_required_else_help(true))]
-    Open {
+    Edit {
+        /// Must exist.
         path: String,
         #[arg(short, long)]
         pass: Option<String>,
     },
+    /// Initialize a new vault.
     #[command(arg_required_else_help(true))]
-    Init { path: String },
+    Init {
+        /// Cannot exist.
+        path: String,
+        #[arg(short, long)]
+        pass: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Command::Open { path, pass } => {
+        Command::Init { path, pass } => {
+            let pass = get_pass(pass)?;
+            let data = edit_in_file(None)?;
+            Vault::new(&data, &pass)?.write(&path, /* overwrite= */ false)?;
+        }
+        Command::Edit { path, pass } => {
             let vault = Vault::from_file(&path)?;
             let pass = get_pass(pass)?;
-            println!("{}", vault.open(&pass)?);
-        }
-        Command::Init { path } => {
-            let pass = get_pass(None)?;
-            let data = prompt_data()?;
-            Vault::new(&data, &pass)?.write(&path)?;
-            println!("success!");
+            let init = vault.read(&pass)?;
+            let data = edit_in_file(Some(&init))?;
+            Vault::new(&data, &pass)?.write(&path, /* overwrite= */ true)?;
         }
     }
 
     Ok(())
 }
 
+fn edit_in_file(init: Option<&str>) -> anyhow::Result<String> {
+    let editor = env::var("EDITOR").with_context(|| "Failed to get the `EDITOR` env var")?;
+    let mut file = NamedTempFile::new().with_context(|| "Failed to create a temporary file")?;
+    file.write_all(init.unwrap_or("").as_bytes())
+        .with_context(|| "Failed to write initial content to the temporary file")?;
+    let path = file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow!("Failed to get temporary file path"))?;
+    let status = process::Command::new(&editor)
+        .arg(path)
+        .status()
+        .with_context(|| "Failed to run editor")?;
+    if !status.success() {
+        bail!("Editor returned with an error status");
+    }
+    fs::read_to_string(path).with_context(|| "Failed to read file content after edited")
+}
+
 fn encrypt(data: &[u8], key: &[u8; 32]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = Aes256Gcm::new(key.into())
         .encrypt(&nonce, data)
-        .map_err(|err| anyhow!("Failed to encrypt plaintext: {}", err))?;
+        .map_err(|_| anyhow!("Failed to encrypt plaintext"))?;
     Ok((ciphertext, nonce.as_slice().to_vec()))
 }
 
@@ -113,7 +145,7 @@ fn decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> anyhow::Result<Ve
     let nonce = Nonce::from_slice(nonce);
     Aes256Gcm::new(key.into())
         .decrypt(nonce, ciphertext)
-        .map_err(|err| anyhow!("Failed to decrypt ciphertext: {}", err))
+        .map_err(|_| anyhow!("Failed to decrypt ciphertext, probably incorrect pass"))
 }
 
 fn get_pass(pass: Option<String>) -> anyhow::Result<String> {
@@ -125,18 +157,6 @@ fn get_pass(pass: Option<String>) -> anyhow::Result<String> {
         bail!("pass too short");
     }
     Ok(pass)
-}
-
-fn prompt_data() -> anyhow::Result<String> {
-    let mut data = String::new();
-    print!("enter data: ");
-    io::stdout()
-        .flush()
-        .with_context(|| "Failed to flush stdout")?;
-    io::stdin()
-        .read_line(&mut data)
-        .with_context(|| "Failed to read from stdin")?;
-    Ok(data)
 }
 
 #[inline]
