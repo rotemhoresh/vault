@@ -174,7 +174,7 @@ fn prompt_pass() -> anyhow::Result<String> {
 
 fn derive_key(pass: &str) -> anyhow::Result<[u8; 32]> {
     let mut key = [0u8; 32];
-    let salt = [0u8; 8];
+    let salt = [0u8; 8]; // FIXME: #4
     Argon2::default()
         .hash_password_into(pass.as_bytes(), &salt, &mut key)
         .map_err(|_| anyhow!("Failed to derive a key from pass"))?;
