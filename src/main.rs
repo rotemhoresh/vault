@@ -20,6 +20,13 @@ use tempfile::NamedTempFile;
 
 const MIN_PASS_LEN: usize = 8;
 
+enum WriteMode {
+    /// Only overwrites, fails if not exists.
+    Overwrite,
+    /// Only creates a new one, fails if exists.
+    CreateNew,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Vault {
     ciphertext: Vec<u8>,
@@ -54,7 +61,8 @@ impl Vault {
             .with_context(|| "Failed to convert plaintext into UTF-8 string")
     }
 
-    pub fn write(&self, path: &str, overwrite: bool) -> anyhow::Result<()> {
+    pub fn write(&self, path: &str, mode: WriteMode) -> anyhow::Result<()> {
+        let overwrite = matches!(mode, WriteMode::Overwrite);
         OpenOptions::new()
             .create_new(!overwrite)
             .truncate(overwrite)
@@ -100,14 +108,14 @@ fn main() -> anyhow::Result<()> {
         Command::Init { path, pass } => {
             let pass = get_pass(pass)?;
             let data = edit_in_file(None)?;
-            Vault::new(&data, &pass)?.write(&path, /* overwrite= */ false)?;
+            Vault::new(&data, &pass)?.write(&path, WriteMode::CreateNew)?;
         }
         Command::Edit { path, pass } => {
             let vault = Vault::from_file(&path)?;
             let pass = get_pass(pass)?;
             let init = vault.read(&pass)?;
             let data = edit_in_file(Some(&init))?;
-            Vault::new(&data, &pass)?.write(&path, /* overwrite= */ true)?;
+            Vault::new(&data, &pass)?.write(&path, WriteMode::Overwrite)?;
         }
     }
 
